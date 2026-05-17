@@ -1,0 +1,819 @@
+---
+title: "STA302 Final Project"
+output:
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{xeCJK}
+  - \setCJKmainfont{SimSun} 
+---
+```{r}
+library(dplyr)
+
+
+df <- read.csv("../data/ames_cleaned.csv")
+
+
+if (!("Age_Remodel" %in% names(df)) &&
+all(c("Year_Sold", "Year_Remod_Add") %in% names(df))) {
+df$Age_Remodel <- df$Year_Sold - df$Year_Remod_Add
+}
+
+
+if ("Age_Remodel" %in% names(df)) {
+df <- df[df$Age_Remodel >= 0, ]
+}
+
+dim(df)
+head(df[, c("Sale_Price","Age_Remodel")])
+
+```
+```{r}
+set.seed(302) 
+
+n <- nrow(df)
+train_prop <- 0.8
+train_idx  <- sample(seq_len(n), size = floor(train_prop * n))
+
+train <- df[train_idx, ]
+test  <- df[-train_idx, ]
+
+dim(train); dim(test)
+
+```
+
+```{r}
+# create Bldg_Type2（OneFam vs Non1Fam）in train / test
+
+train <- train %>%
+mutate(Bldg_Type2 = ifelse(as.character(Bldg_Type) == "OneFam",
+"OneFam", "Non1Fam"),
+Bldg_Type2 = factor(Bldg_Type2, levels = c("OneFam","Non1Fam")))
+
+test <- test %>%
+mutate(Bldg_Type2 = ifelse(as.character(Bldg_Type) == "OneFam",
+"OneFam", "Non1Fam"),
+Bldg_Type2 = factor(Bldg_Type2, levels = c("OneFam","Non1Fam")))
+
+# build Sale_Price model within train only
+
+model_train <- lm(
+Sale_Price ~ Gr_Liv_Area + Mas_Vnr_Area + Age_Remodel +
+Bedroom_AbvGr + Total_Bsmt_SF + Garage_Cars +
+Full_Bath + Fireplaces + Bldg_Type2 +
+Gr_Liv_Area:Bldg_Type2,
+data = train
+)
+
+summary(model_train)
+
+```
+
+```{r}
+y_obs_train <- model.response(model.frame(model_train))
+y_hat_train <- fitted(model_train)
+resid_train <- resid(model_train)
+
+c(length(y_obs_train), length(y_hat_train), length(resid_train))
+
+```
+
+```{r}
+plot(y_hat_train, y_obs_train,
+pch = 16, cex = 0.5,
+xlab = "Fitted values (train)",
+ylab = "Observed Sale_Price (train)",
+main = "Observed vs Fitted (train)")
+abline(0, 1, col = "red", lwd = 2, lty = 2)              
+lines(lowess(y_hat_train, y_obs_train), col = "blue", lwd = 2)  # LOESS curve
+
+```
+
+```{r}
+plot(y_hat_train, resid_train,
+pch = 16, cex = 0.5,
+xlab = "Fitted values (train)",
+ylab = "Residuals",
+main = "Residuals vs Fitted (train)")
+abline(h = 0, col = "red", lwd = 2)
+lines(lowess(y_hat_train, resid_train), col = "blue", lwd = 2)
+
+```
+
+```{r}
+num_x <- c("Gr_Liv_Area","Mas_Vnr_Area","Age_Remodel","Bedroom_AbvGr",
+"Total_Bsmt_SF","Garage_Cars","Full_Bath","Fireplaces")
+
+par(mfrow = c(3,3), mar = c(4,4,2,1))
+for (v in num_x) {
+x <- train[[v]]
+plot(x, resid_train,
+pch = 16, cex = 0.5,
+xlab = v, ylab = "Residuals",
+main = paste("Residuals vs", v))
+abline(h = 0, col = "red", lwd = 2)
+lines(lowess(x, resid_train), col = "blue", lwd = 2)
+}
+
+# Residuals by Bldg_Type2
+
+boxplot(resid_train ~ train$Bldg_Type2,
+xlab = "Bldg_Type2", ylab = "Residuals",
+main = "Residuals by Bldg_Type2")
+abline(h = 0, col = "red", lwd = 2)
+par(mfrow = c(1,1))
+
+```
+
+```{r}
+qqnorm(resid_train,
+main = "Normal Q-Q Plot of Residuals (train)")
+qqline(resid_train, col = "red", lwd = 2)
+
+```
+```{r}
+C2_data <- train[, num_x]
+
+pairs(C2_data,
+pch = 16, cex = 0.3,
+main = "C2: Pairwise Scatterplots of Predictors (train)")
+
+```
+
+
+
+---
+
+
+```{r boxcox_Y_and_X, echo=TRUE, message=FALSE, warning=FALSE}
+library(MASS)
+
+## 4.1 对 Y 做 Box–Cox
+bc <- boxcox(model_train, lambda = seq(-0.5, 0.5, by = 0.05))
+
+lambda_y_hat <- bc$x[which.max(bc$y)]   # 真正的最优 λ（写在报告里）
+lambda_y_hat
+
+lambda_y <- 0.25                        # 模型里实际使用的 λ（四次方根）
+
+# Box–Cox 通用变换函数
+bc_transform <- function(x, lambda) {
+  if (abs(lambda) < 1e-6) {
+    log(x)
+  } else {
+    (x^lambda - 1) / lambda
+  }
+}
+
+# 生成变换后的响应变量 Y_bc
+train$Y_bc <- bc_transform(train$Sale_Price, lambda_y)
+y_bc <- train$Y_bc   # 方便后面 lm 使用
+
+## 4.2 对每个 X 单独做 Box–Cox，先记录 λ 到 lambda_list（用于决定怎么近似）
+predictor_names <- c("Gr_Liv_Area", "Total_Bsmt_SF", "Mas_Vnr_Area",
+                     "Age_Remodel", "Bedroom_AbvGr", "Garage_Cars",
+                     "Full_Bath", "Fireplaces")
+
+lambda_list <- numeric(length(predictor_names))
+names(lambda_list) <- predictor_names
+
+for (v in predictor_names) {
+
+  x <- train[[v]]
+
+  # Box-Cox 要求 >0，有 0 或负数就整体 +1（只在变换时用）
+  if (any(x <= 0)) {
+    x_use <- x + 1
+  } else {
+    x_use <- x
+  }
+
+  # 对单个 predictor 做 Box–Cox：Y_bc ~ x_use
+  bc_x <- boxcox(
+    lm(y_bc ~ x_use),
+    lambda = seq(-0.5, 0.5, by = 0.05),
+    plotit = FALSE
+  )
+
+  best_lambda <- bc_x$x[which.max(bc_x$y)]
+  lambda_list[v] <- best_lambda
+}
+
+lambda_list
+```
+
+
+```{r manual_transform_X, echo=TRUE}
+
+## 手动根据 lambda_list 做变换（可解释性更好）
+
+# 变换规则：
+#  λ ≈ 0.50 → sqrt()
+#  λ ≈ 0.05 → log()
+#  λ ≈ 0.35 → 立方根（1/3 次方）
+#  λ ≈ 0.25 → 四次方根（1/4 次方）
+
+### -------- 1) λ ≈ 0.50  → sqrt() --------
+train$Gr_Liv_Area_bc    <- sqrt(train$Gr_Liv_Area)
+train$Total_Bsmt_SF_bc  <- sqrt(train$Total_Bsmt_SF)
+train$Mas_Vnr_Area_bc   <- sqrt(train$Mas_Vnr_Area)
+
+### -------- 2) λ ≈ 0.05 → log() --------
+# 防止 0 值报错，统一 +1 再 log
+train$Age_Remodel_bc    <- log(train$Age_Remodel + 1)
+train$Bedroom_AbvGr_bc  <- log(train$Bedroom_AbvGr + 1)
+
+### -------- 3) λ ≈ 0.35 → 立方根 --------
+train$Garage_Cars_bc    <- (train$Garage_Cars)^(1/3)
+
+### -------- 4) λ ≈ 0.25 → 四次方根 --------
+train$Full_Bath_bc      <- (train$Full_Bath)^(1/4)
+train$Fireplaces_bc     <- (train$Fireplaces)^(1/4)
+
+## 输出检查
+summary(train[, c("Gr_Liv_Area_bc","Total_Bsmt_SF_bc","Mas_Vnr_Area_bc",
+                  "Age_Remodel_bc","Bedroom_AbvGr_bc","Garage_Cars_bc",
+                  "Full_Bath_bc","Fireplaces_bc")])
+
+```
+
+```{r}
+model_bc <- lm(
+Y_bc ~ Gr_Liv_Area_bc + Mas_Vnr_Area_bc + Age_Remodel_bc +
+Bedroom_AbvGr_bc + Total_Bsmt_SF_bc + Garage_Cars_bc +
+Full_Bath_bc + Fireplaces_bc + Bldg_Type2 +
+Gr_Liv_Area_bc:Bldg_Type2,
+data = train
+)
+
+summary(model_bc)
+
+```
+
+```{r}
+y_hat_bc <- fitted(model_bc)
+resid_bc <- resid(model_bc)
+
+c(length(y_hat_bc), length(resid_bc), length(train$Y_bc))
+
+```
+
+```{r}
+y_obs_bc <- train$Y_bc
+
+plot(y_hat_bc, y_obs_bc,
+pch = 16, cex = 0.5,
+xlab = "Fitted values (Box–Cox model, train)",
+ylab = "Observed Y_bc",
+main = "Observed vs Fitted (Box–Cox, train)")
+abline(0, 1, col = "red", lwd = 2, lty = 2)
+lines(lowess(y_hat_bc, y_obs_bc), col = "blue", lwd = 2)
+
+```
+
+```{r}
+plot(y_hat_bc, resid_bc,
+pch = 16, cex = 0.5,
+xlab = "Fitted values (Box–Cox model, train)",
+ylab = "Residuals",
+main = "Residuals vs Fitted (Box–Cox, train)")
+abline(h = 0, col = "red", lwd = 2)
+lines(lowess(y_hat_bc, resid_bc), col = "blue", lwd = 2)
+
+```
+
+```{r}
+bc_vars <- paste0(predictor_names, "_bc")
+
+par(mfrow = c(3,3), mar = c(4,4,2,1))
+
+# 1–8：数值型 X_bc
+
+for (v in bc_vars) {
+plot(train[[v]], resid_bc,
+pch = 16, cex = 0.5,
+xlab = v,
+ylab = "Residuals",
+main = paste("Residuals vs", v))
+abline(h = 0, col = "red")
+lines(lowess(train[[v]], resid_bc), col = "blue", lwd = 1.5)
+}
+
+# 第9张：Bldg_Type2
+
+boxplot(resid_bc ~ train$Bldg_Type2,
+xlab = "Bldg_Type2",
+ylab = "Residuals",
+main = "Residuals by Bldg_Type2 (Box–Cox)",
+col = c("lightgrey","lightblue"))
+abline(h = 0, col = "red", lwd = 2)
+
+par(mfrow = c(1,1))
+
+```
+
+```{r}
+qqnorm(resid_bc,
+main = "Normal Q-Q Plot of Residuals (Box–Cox model)")
+qqline(resid_bc, col = "red", lwd = 2)
+
+```
+
+```{r}
+bc_data <- train[, bc_vars]
+
+pairs(bc_data,
+pch = 16, cex = 0.3,
+main = "C2: Pairwise Scatterplots of Predictors (Box–Cox transformed)")
+
+```
+
+```{r}
+library(car)
+
+# VIF for full transformed model
+vif_bc <- vif(model_bc)
+vif_bc
+
+# Correlation matrix for transformed numeric predictors
+bc_vars <- c("Gr_Liv_Area_bc", "Total_Bsmt_SF_bc", "Mas_Vnr_Area_bc",
+             "Age_Remodel_bc", "Bedroom_AbvGr_bc", "Garage_Cars_bc",
+             "Full_Bath_bc", "Fireplaces_bc")
+
+cor_bc <- cor(train[, bc_vars])
+round(cor_bc, 3)
+```
+```{r}
+# Overall F-test: does the model explain Y_bc better than no predictors?
+mod0_bc <- lm(Y_bc ~ 1, data = train)       # null model with intercept only
+anova(mod0_bc, model_bc)
+```
+
+```{r}
+summary(model_bc)
+```
+
+```{r}
+#Test whether interaction term is needed 
+model_bc_no_int <- lm(
+  Y_bc ~ Gr_Liv_Area_bc + Mas_Vnr_Area_bc + Age_Remodel_bc +
+    Bedroom_AbvGr_bc + Total_Bsmt_SF_bc + Garage_Cars_bc +
+    Full_Bath_bc + Fireplaces_bc + Bldg_Type2,
+  data = train
+)
+
+anova(model_bc_no_int, model_bc) 
+```
+```{r}
+#Test dropping the “bedroom” variable, since it overlaps with size and baths.
+model_bc_no_bedroom <- lm(
+  Y_bc ~ Gr_Liv_Area_bc + Mas_Vnr_Area_bc + Age_Remodel_bc +
+    Total_Bsmt_SF_bc + Garage_Cars_bc + Full_Bath_bc +
+    Fireplaces_bc + Bldg_Type2 + Gr_Liv_Area_bc:Bldg_Type2,
+  data = train
+)
+
+anova(model_bc_no_bedroom, model_bc)
+```
+
+```{r}
+#Test dropping the “bedroom” variable, since it overlaps with size and baths.
+model_bc_no_amen <- lm(
+  Y_bc ~ Gr_Liv_Area_bc + Mas_Vnr_Area_bc + Age_Remodel_bc +
+    Bedroom_AbvGr_bc + Total_Bsmt_SF_bc + Bldg_Type2 +
+    Gr_Liv_Area_bc:Bldg_Type2,
+  data = train
+)
+
+anova(model_bc_no_amen, model_bc)
+```
+```{r}
+library(MASS)
+
+step_bc_back <- stepAIC(
+  model_bc,
+  direction = "backward",  # start from full and only drop
+  trace = TRUE            # set TRUE if you want to see each step printed
+)
+
+summary(step_bc_back)
+```
+```{r}
+step_bc_step <- stepAIC(model_bc, direction = "both", trace = FALSE)
+summary(step_bc_step)
+```
+```{r}
+#BIC 
+n_train <- nrow(train)
+
+step_bc_BIC <- stepAIC(
+  model_bc,
+  direction = "backward",
+  k = log(n_train),
+  trace = FALSE
+)
+
+summary(step_bc_BIC)
+```
+```{r}
+# AIC(model_bc, step_bc)
+# BIC(model_bc, step_bc)
+# 
+# c(
+#   full    = summary(model_bc)$adj.r.squared,
+#   stepAIC = summary(step_bc)$adj.r.squared
+# )
+# c(
+#   full    = summary(model_bc)$adj.r.squared,
+#   stepAIC = summary(step_bc)$adj.r.squared
+# )
+
+model_bc
+
+step_bc_back
+
+step_bc_step
+
+step_bc_BIC
+```
+# influential points
+
+```{r}
+# pick one (all same) to be the final model
+final_bc <- model_bc   
+
+# sample & predictor numbers
+n_bc <- nrow(train)
+p_bc <- length(coef(final_bc)) - 1
+
+# cutoffs
+h_cut    <- 2 * (p_bc + 1) / n_bc
+cook_cut <- qf(0.5, df1 = p_bc + 1, df2 = n_bc - p_bc - 1)
+fit_cut  <- 2 * sqrt((p_bc + 1) / n_bc)
+beta_cut <- 2 / sqrt(n_bc)
+
+# diagnose variables
+h_ii      <- hatvalues(final_bc)         # leverage
+r_std     <- rstandard(final_bc)         # standardized residuals
+cook_d    <- cooks.distance(final_bc)    # Cook's distance
+dffits_i  <- dffits(final_bc)            # DFFITS
+dfbetas_i <- dfbetas(final_bc)           # DFBETAS (矩阵)
+
+# problematic points
+lev_pts    <- which(h_ii > h_cut)                    
+outliers   <- which(r_std > 4 | r_std < -4)         
+cook_infl  <- which(cook_d > cook_cut)              
+fit_infl   <- which(abs(dffits_i) > fit_cut)         
+
+cat("leverage points \n", lev_pts, "\n\n")
+cat("outliers \n", outliers, "\n\n")
+cat("cook distance influential \n", cook_infl, "\n\n")
+cat("DFFITS influential \n", fit_infl, "\n\n")
+
+# debetas
+for (j in 1:ncol(dfbetas_i)) {
+  cat("DFBETAS for beta", colnames(dfbetas_i)[j], ":\n")
+  print(which(abs(dfbetas_i[, j]) > beta_cut))
+  cat("\n")
+}
+
+```
+
+
+```{r}
+## find how many influential points are in at least 3 categories
+is_lev    <- h_ii > h_cut
+is_out    <- (r_std > 4 | r_std < -4)
+is_cook   <- cook_d > cook_cut
+is_dffits <- abs(dffits_i) > fit_cut
+
+flag_count <- is_lev + is_out + is_cook + is_dffits
+
+idx_3plus <- which(flag_count >= 3)
+idx_3plus
+
+# find their dfbeta count
+dfb_flag <- abs(dfbetas_i) > beta_cut 
+dfb_count <- rowSums(dfb_flag)
+
+
+# summary table
+infl_summary <- data.frame(
+  id         = idx_3plus,
+  n_flags    = flag_count[idx_3plus],
+  n_badbetas = dfb_count[idx_3plus],
+  leverage   = is_lev[idx_3plus],
+  outlier    = is_out[idx_3plus],
+  cook       = is_cook[idx_3plus],
+  dffits     = is_dffits[idx_3plus]
+)
+infl_summary
+
+
+```
+
+# test
+```{r}
+# do the same transformation on test
+
+test$Gr_Liv_Area_bc   <- sqrt(test$Gr_Liv_Area)
+test$Total_Bsmt_SF_bc <- sqrt(test$Total_Bsmt_SF)
+test$Mas_Vnr_Area_bc  <- sqrt(test$Mas_Vnr_Area)
+
+test$Age_Remodel_bc   <- log(test$Age_Remodel + 1)
+test$Bedroom_AbvGr_bc <- log(test$Bedroom_AbvGr + 1)
+
+test$Garage_Cars_bc   <- (test$Garage_Cars)^(1/3)
+test$Full_Bath_bc     <- (test$Full_Bath)^(1/4)
+test$Fireplaces_bc    <- (test$Fireplaces)^(1/4)
+
+test$Y_bc <- bc_transform(test$Sale_Price, lambda_y)
+
+
+summary(test[, c("Y_bc", "Gr_Liv_Area_bc","Total_Bsmt_SF_bc","Mas_Vnr_Area_bc",
+                 "Age_Remodel_bc","Bedroom_AbvGr_bc","Garage_Cars_bc",
+                 "Full_Bath_bc","Fireplaces_bc")])
+
+
+```
+
+```{r}
+
+# prediction of train set
+pred_train_bc <- predict(final_bc, newdata = train)
+
+# predicttion of test set
+pred_test_bc  <- predict(final_bc, newdata = test)
+
+# MSE
+mse_train_bc <- mean((train$Y_bc - pred_train_bc)^2)
+mse_test_bc  <- mean((test$Y_bc  - pred_test_bc)^2)
+
+mse_train_bc
+mse_test_bc
+
+```
+```{r}
+summary(model_bc)
+```
+
+
+```{r}
+bc_inverse <- function(y_bc, lambda = 0.25) {
+  (lambda * y_bc + 1)^ (1 / lambda)
+}
+
+# go back to original housing price
+pred_train_price <- bc_inverse(pred_train_bc, lambda = 0.25)
+pred_test_price  <- bc_inverse(pred_test_bc,  lambda = 0.25)
+
+mse_train_bc
+mse_test_bc
+mean(pred_train_bc)
+mean(pred_test_bc)
+mean(pred_train_price)
+mean(pred_test_price)
+
+mse_train_price  <- mean((train$Sale_Price - pred_train_price)^2)
+mse_test_price   <- mean((test$Sale_Price  - pred_test_price)^2)
+
+rmse_train_price <- sqrt(mse_train_price)
+rmse_test_price  <- sqrt(mse_test_price)
+
+rmse_train_price
+rmse_test_price
+```
+
+```{r}
+rmse_train_bc <- sqrt(mse_train_bc)
+rmse_test_bc  <- sqrt(mse_test_bc)
+sd_ybc        <- sd(train$Y_bc)
+
+rmse_train_bc
+rmse_test_bc
+sd_ybc
+rmse_train_bc / sd_ybc
+rmse_test_bc  / sd_ybc
+
+```
+
+On the Box–Cox–transformed scale, the training and test MSEs are 12.95 and 12.96 (RMSE ≈ 3.60), which correspond to about 43% of the standard deviation of the transformed response. This indicates that the model explains a meaningful portion of the variation in sale prices, but there is still substantial unexplained variability.
+
+On the original price scale, the training and test RMSEs are approximately $36,000 and $31,500, respectively. The fact that the test error is very close to the training error suggests that the model does not overfit severely and generalizes reasonably well to new data, although the prediction errors remain non-trivial in economic terms.
+
+
+# 
+```{r}
+# training model
+mod_train <- final_bc  
+
+mod_test <- lm(
+  Y_bc ~ Gr_Liv_Area_bc + Mas_Vnr_Area_bc + Age_Remodel_bc +
+    Bedroom_AbvGr_bc + Total_Bsmt_SF_bc + Garage_Cars_bc +
+    Full_Bath_bc + Fireplaces_bc + Bldg_Type2 +
+    Gr_Liv_Area_bc:Bldg_Type2,
+  data = test
+)
+
+p      <- length(coef(mod_train)) - 1   # 10 predictors
+n_tr   <- nrow(train)
+n_te   <- nrow(test)
+
+hcut_tr  <- 2 * (p + 1) / n_tr
+hcut_te  <- 2 * (p + 1) / n_te
+
+cookcut_tr <- qf(0.5, df1 = p + 1, df2 = n_tr - p - 1)
+cookcut_te <- qf(0.5, df1 = p + 1, df2 = n_te - p - 1)
+
+fitcut_tr  <- 2 * sqrt((p + 1) / n_tr)
+fitcut_te  <- 2 * sqrt((p + 1) / n_te)
+
+
+# training set
+n_lev_tr   <- length(which(hatvalues(mod_train) > hcut_tr))
+n_out_tr   <- length(which(abs(rstandard(mod_train)) > 4))
+n_cook_tr  <- length(which(cooks.distance(mod_train) > cookcut_tr))
+n_dffits_tr<- length(which(abs(dffits(mod_train)) > fitcut_tr))
+
+cbind(n_lev_tr, n_out_tr, n_cook_tr, n_dffits_tr)
+
+# test set
+n_lev_te   <- length(which(hatvalues(mod_test) > hcut_te))
+n_out_te   <- length(which(abs(rstandard(mod_test)) > 4))
+n_cook_te  <- length(which(cooks.distance(mod_test) > cookcut_te))
+n_dffits_te<- length(which(abs(dffits(mod_test)) > fitcut_te))
+
+cbind(n_lev_te, n_out_te, n_cook_te, n_dffits_te)
+
+```
+When we refit the final model on the test set and counted high-leverage points, extreme standardized residuals and large DFFITS using the same cutoffs, the proportions of flagged observations were similar in the training and test sets (e.g., 222 vs 53 high-leverage points and 142 vs 52 large-DFFITS points under an 80/20 split). This suggests that potentially problematic observations are not unique to one split of the data, although our main influential-point analysis is based on the training sample.
+
+
+
+```{r influence_plot, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+
+diag_long <- tibble(
+  Set    = rep(c("Training", "Test"), each = 4),
+  Metric = rep(c("High leverage",
+                 "|St. resid| > 4",
+                 "Cook's D",
+                 "|DFFITS|"), times = 2),
+  n      = c(rep(n_tr, 4), rep(n_te, 4)),
+  Count  = c(
+    n_lev_tr,    n_out_tr,    n_cook_tr,    n_dffits_tr,
+    n_lev_te,    n_out_te,    n_cook_te,    n_dffits_te
+  )
+) %>%
+  mutate(Percent = 100 * Count / n)
+
+ggplot(diag_long, aes(x = Metric, y = Percent, fill = Set)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = paste0(Count, " (", round(Percent, 1), "%)")),
+            position = position_dodge(width = 0.7),
+            vjust = -0.4, size = 3) +
+  scale_y_continuous(
+    name   = "Percent of observations",
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  scale_fill_manual(values = c("Training" = "#4E79A7",
+                               "Test"     = "#A0CBE8")) +
+  labs(
+    x = NULL,
+    title = "Potentially problematic observations\nin training and test sets"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position      = "top",
+    panel.grid.major.x   = element_blank(),
+    axis.text.x          = element_text(angle = 20, hjust = 1),
+    plot.title           = element_text(hjust = 0.5)
+  )
+
+
+```
+
+```{r final_model_table, echo=FALSE}
+## 0. Recreate pred_order from the full model ----
+full_mod   <- model_bc
+pred_order <- attr(terms(full_mod), "term.labels") # 提取自变量名字
+
+## 1. Main model-selection table with short codes ----
+pred_codes <- paste0("x", seq_along(pred_order))   # x1, x2, ...
+
+# Model labels: Y_bc = β0 + ε, Y_bc = β0 + β1x1 + ε, ...
+model_labels <- c(
+  "Y_bc = β0 + ε",
+  paste0(
+    "Y_bc = β0 + ",
+    sapply(1:length(pred_order), function(k) {
+      paste0("β", 1:k, "x", 1:k, collapse = " + ")
+    }),
+    " + ε"
+  )
+)
+
+# Predictors shown as codes: x1, x1, x2, ...
+pred_labels_code <- c(
+  "None (intercept only)",
+  sapply(1:length(pred_order), function(k) {
+    paste(pred_codes[1:k], collapse = ", ")
+  })
+)
+
+# Extract metrics
+rss_vals    <- sapply(fits, deviance)
+aic_vals    <- sapply(fits, AIC)
+bic_vals    <- sapply(fits, BIC)
+adj_r2_vals <- as.numeric(sapply(fits, function(m) summary(m)$adj.r.squared))
+
+model_sel_table <- data.frame(
+  Model            = model_labels,
+  p                = 0:length(pred_order),
+  RSS              = rss_vals,
+  AIC              = aic_vals,
+  BIC              = bic_vals,
+  Adj_R2           = round(adj_r2_vals, 2),
+  Predictors_codes = pred_labels_code,
+  row.names        = NULL
+)
+
+library(kableExtra)
+
+model_sel_table |>
+  kbl(
+    caption = "Summary of nested candidate models with RSS, AIC, BIC and adjusted R^2.",
+    digits  = 2,
+    align   = c("l", "c", "r", "r", "r", "c")
+  ) |>
+  kable_styling(
+    full_width = FALSE,
+    position   = "center",
+    font_size  = 9
+  ) |>
+  column_spec(1, width = "4cm") |>
+  column_spec(6, width = "3cm")
+
+```
+
+
+
+
+
+```{r}
+## 2. Codebook: what does x0, x1, x2, ... mean? ----
+
+# 1) 先根据最终 full_mod 拿到真正用到的自变量顺序
+pred_order <- attr(terms(full_mod), "term.labels")
+
+# 2) 自变量说明字典
+desc_map <- c(
+  Gr_Liv_Area_bc               = "Above–ground living area (Box–Cox)",
+  Total_Bsmt_SF_bc             = "Total basement area (Box–Cox)",
+  Mas_Vnr_Area_bc              = "Masonry veneer area (Box–Cox)",
+  Age_Remodel_bc               = "Remodel age (years since remodel, Box–Cox)",
+  Bedroom_AbvGr_bc             = "Bedrooms above ground (Box–Cox)",
+  Garage_Cars_bc               = "Garage capacity (number of cars, Box–Cox)",
+  Full_Bath_bc                 = "Number of full bathrooms (Box–Cox)",
+  Fireplaces_bc                = "Number of fireplaces (Box–Cox)",
+  Bldg_Type2                   = "Building type: non–single family (indicator)",
+  "Gr_Liv_Area_bc:Bldg_Type2"  = "Interaction: Above–ground living area × Building type"
+)
+
+pred_names_readable <- unname(desc_map[pred_order])
+pred_codes <- paste0("x", seq_along(pred_order))
+
+# 3) 先做自变量部分
+codebook_pred <- data.frame(
+  Code        = pred_codes,
+  Variable    = pred_order,
+  Description = pred_names_readable
+)
+
+# 4) 再单独加一行响应变量 y
+codebook_y <- data.frame(
+  Code        = "y",
+  Variable    = "Y_bc",
+  Description = "Box–Cox transformed sale price: (Sale_Price^0.25 - 1) / 0.25"
+)
+
+# 5) 合在一起，y 放最上面
+codebook <- rbind(codebook_y, codebook_pred)
+
+library(kableExtra)
+
+codebook |>
+  kbl(
+    caption = "Mapping between response/predictor codes (y, x1, ..., xk) and variables used in the model.",
+    align   = c("c", "l", "l")
+  ) |>
+  kable_styling(
+    full_width = FALSE,
+    position   = "center",
+    font_size  = 9
+  )
+
+```
+
+
+
